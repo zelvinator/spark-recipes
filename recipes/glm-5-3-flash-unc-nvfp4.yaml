@@ -1,0 +1,98 @@
+# GLM-5.3-Flash UNCENSORED NVFP4 - TP=4 across 4x DGX Spark, b12x stack.
+# NVFP4 sibling of glm-5-3-flash-sm121v8.yaml (dealignai UNCENSORED-FP8 on the
+# radixark image). Serves dealignai/GLM-5.3-Flash-UNCENSORED-NVFP4 (modelopt
+# NVFP4, hub rev 745aac2f, 194.7 GB byte-verified, 120 shards), mirroring the
+# NVFP4 flag set of glm-5.3-flash.yaml (LIL NVFP4-Spark) scaled to TP=4.
+# Changed vs the sm121v8 sibling: container -> vllm-node-b12x (radixark image
+# has no NVFP4/b12x kernels), + --quantization modelopt + b12x moe/linear
+# backends + --load-format b12x + --dtype bfloat16, block 2304 -> 256 (b12x
+# convention), spec decode gains humming draft (LIL style); dropped:
+# mods/glm53-flash-indexer, --trust-remote-code, --async-scheduling,
+# --compilation-config FULL (b12x uses the AOT/V2-runner env block).
+# MTP head present (layers.45.eh_proj, BF16); k=3 = sibling value (LIL ran 5).
+# Needs mods/fix-glm5next-nvfp4-ignore: the export lists the fused KDA
+# projection as '*.self_attn.in_proj_qkvbfg_a' but the runtime builds
+# 'in_proj_qkvgfab'; without the rename the BF16 KDA projection is built
+# quantized and weight load aborts with a dest/source shape assert.
+# Model card quirk: reasoning_effort only 'low'/'high' (anything else -> max);
+# at max keep client max_tokens >= 6000 or replies come back empty.
+# Fallbacks: if --load-format b12x is rejected use --load-format instanttensor
+# + --model-loader-extra-config '{"instanttensor_copy":false}' (b12x-lane
+# style); if the engine asks for modelopt_mixed, use it.
+recipe_version: "1"
+name: GLM-5.3-Flash-UNC-NVFP4
+description: vLLM serving dealignai/GLM-5.3-Flash-UNCENSORED-NVFP4 (b12x stack, modelopt NVFP4), TP=4 on a 4-Spark cluster
+model: dealignai/GLM-5.3-Flash-UNCENSORED-NVFP4
+container: vllm-node-b12x
+build_args:
+  - --exp-b12x
+cluster_only: true
+mods:
+  - mods/fix-glm5next-nvfp4-ignore
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 4
+  decode_context_parallel: 1
+  block_size: 256
+  max_model_len: 1048576
+  max_num_seqs: 4
+  max_num_batched_tokens: 8192
+  num_speculative_tokens: 3
+  gpu_memory_utilization: 0.885
+env:
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+  VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "1800"
+  HF_HUB_OFFLINE: "1"
+  CUTE_DSL_ARCH: "sm_121a"
+  SAFETENSORS_FAST_GPU: "1"
+  VLLM_ENABLE_ROCE_ALLREDUCE: "1"
+  VLLM_ROCE_ALLREDUCE_MAX_SIZE: "2MB"
+  VLLM_WORKER_MULTIPROC_METHOD: "spawn"
+  VLLM_SSM_CONV_STATE_LAYOUT: "DS"
+  VLLM_USE_AOT_COMPILE: "1"
+  VLLM_USE_MEGA_AOT_ARTIFACT: "1"
+  VLLM_USE_V2_MODEL_RUNNER: "1"
+  VLLM_ENABLE_PCIE_ALLREDUCE: "0"
+  B12X_POLICY_MODE: "auto"
+  INSTANTTENSOR_BACKEND: "BUFFERED"
+  INSTANTTENSOR_BUFFER_SIZE: "67108864"
+  INSTANTTENSOR_CHUNK_SIZE: "8388608"
+  INSTANTTENSOR_CONCURRENCY: "1"
+  INSTANTTENSOR_IO_DEPTH: "3"
+  NCCL_IB_TC: "106"
+  NCCL_NET_PLUGIN: "none"
+  NCCL_IB_SUBNET_AWARE_ROUTING: "1"
+  NCCL_IB_MERGE_NICS: "0"
+  NCCL_MAX_NCHANNELS: "4"
+  NCCL_MIN_NCHANNELS: "4"
+  NCCL_CUMEM_ENABLE: "0"
+  NCCL_DEBUG: "WARN"
+command: |
+  vllm serve /root/.cache/huggingface/hub/models--dealignai--GLM-5.3-Flash-UNCENSORED-NVFP4/snapshots/745aac2ff0f10acf961f396df3f9418598aa7327/ \
+      --served-model-name glm-5.3-flash \
+      --host {host} \
+      --port {port} \
+      --tensor-parallel-size {tensor_parallel} \
+      --decode-context-parallel-size {decode_context_parallel} \
+      --dtype bfloat16 \
+      --quantization modelopt \
+      --mamba-cache-mode align \
+      --attention-backend B12X \
+      --moe-backend b12x \
+      --linear-backend b12x \
+      --load-format b12x \
+      --enable-prefix-caching \
+      --enable-chunked-prefill \
+      --no-enable-flashinfer-autotune \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --kv-cache-dtype fp8 \
+      --block-size {block_size} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --speculative-config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens},"moe_backend":"humming","attention_backend":"B12X"}}' \
+      --reasoning-parser glm45 \
+      --tool-call-parser glm47 \
+      --enable-auto-tool-choice

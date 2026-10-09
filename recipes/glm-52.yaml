@@ -1,0 +1,80 @@
+# GLM-5.2 QuantTrio Int4-Int8Mix on 4x DGX Spark
+# TP=4, MTP k=4, 200K context, fp8_ds_mla KV cache
+#
+# Prerequisites:
+#   Image must be pre-baked with sm121 sparse-MLA mods + NCCL 2.30.4:
+#     ./build-and-copy.sh --vllm-ref ab666069935c1f23e8ef56038b4659ac9e8f19f8 \ -t vllm-node-tf5-glm52-b12x:probe --tf5
+#     # then bake mods + NCCL + commit as vllm-node-tf5-glm52-b12x:probe-modded
+#
+# Usage:
+#   ./run-recipe.sh glm52-int4int8-tp4 \
+#     -n 192.168.192.1,192.168.192.2,192.168.192.3,192.168.192.4 \
+#     --no-ray
+#
+recipe_version: "1"
+name: GLM-5.2-Int4-Int8Mix-TP4
+description: GLM-5.2 Int4-Int8Mix (QuantTrio) on 4x DGX Spark, TP=4, MTP k=4, 200K ctx
+cluster_only: true
+
+# Pre-baked image with sm121 sparse-MLA + b12x + NCCL 2.30.4 + indexer patch
+container: vllm-node-tf5-glm52-b12x:probe-modded
+
+# HF model ID — the recipe system handles download + mount
+#model: QuantTrio/GLM-5.2-Int4-Int8Mix
+
+env:
+  VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "1800"
+    #HF_HOME: /cache/huggingface
+  HF_HUB_OFFLINE: "1"
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "256"
+  GLM52_BIND_HOST_TRITON: "1"
+  GLM52_MQA_LOGITS_TRITON: "1"
+  GLM52_PAGED_MQA_TRITON: "1"
+  GLM52_PAGED_MQA_TOPK_CHUNK_SIZE: "8192"
+  GLM52_B12X_MLA: "1"
+  TORCH_CUDA_ARCH_LIST: "12.1a"
+    #NCCL_NET: IB
+    #NCCL_IB_DISABLE: "0"
+    #NCCL_IB_GID_INDEX: "3"
+    #NCCL_CROSS_NIC: "1"
+    #NCCL_IGNORE_CPU_AFFINITY: "1"
+    #NCCL_DEBUG: WARN
+    #NCCL_MAX_NCHANNELS: "4"
+    #NCCL_MIN_NCHANNELS: "4"
+    #NCCL_IB_HCA: "rocep1s0f0"
+    #NCCL_SOCKET_IFNAME: "enp1s0f0np0"
+    #GLOO_SOCKET_IFNAME: "enp1s0f0np0"
+  VLLM_MARLIN_USE_ATOMIC_ADD: "1"
+  OMP_NUM_THREADS: "8"
+  RAY_memory_monitor_refresh_ms: "0"
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+
+command: |
+  vllm serve QuantTrio/GLM-5.2-Int4-Int8Mix \
+    --served-model-name glm-5.2 \
+    --host 0.0.0.0 --port {port} \
+    --trust-remote-code \
+    --reasoning-parser glm45 \
+    --tool-call-parser glm47 \
+    --enable-auto-tool-choice \
+    --enable-prefix-caching \
+    --async-scheduling \
+    --tensor-parallel-size {tensor_parallel} \
+    --pipeline-parallel-size 1 \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens 8192 \
+    --kv-cache-dtype fp8_ds_mla \
+    --gpu-memory-utilization 0.91 --kv-cache-memory-bytes 10950000000 \
+    --distributed-executor-backend ray \
+    --compilation-config '{{"cudagraph_mode":"FULL"}}' \
+    --speculative-config '{{"method":"mtp","num_speculative_tokens":4,"draft_tensor_parallel_size":1,"attention_backend":"FLASHMLA_SPARSE"}}'
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 4
+  gpu_memory_utilization: 0.9
+  max_model_len: 128000
+  max_num_seqs: 2

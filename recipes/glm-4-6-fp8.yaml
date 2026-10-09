@@ -1,0 +1,45 @@
+recipe_version: "1"
+name: GLM-4.6-FP8
+description: vLLM serving zai-org/GLM-4.6-FP8 from NFS mount
+model: zai-org/GLM-4.6-FP8
+
+container: vllm/vllm-openai:qwen38-flash-next
+
+env:
+  HF_HUB_OFFLINE: "1"
+  # NCCL tuning (plain names reach the engine; interface/HCA vars are
+  # launcher-injected from .env — do not duplicate)
+  NCCL_IB_TC: "106"
+  NCCL_NET_PLUGIN: "none"
+  NCCL_IB_SUBNET_AWARE_ROUTING: "1"
+  NCCL_IB_MERGE_NICS: "0"
+  NCCL_MAX_NCHANNELS: "4"
+  NCCL_MIN_NCHANNELS: "4"
+  NCCL_CROSS_NIC: "1"
+  NCCL_CUMEM_ENABLE: "0"
+  NCCL_DEBUG: "WARN"
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 4
+  gpu_memory_utilization: 0.86
+  max_model_len: auto
+  max_num_seqs: 4
+
+
+command: |
+  vllm serve zai-org/GLM-4.6-FP8 \
+      --host {host} \
+      --port {port} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --speculative-config.method mtp \
+      --speculative-config.num_speculative_tokens 1 \
+      --reasoning-parser glm45 \
+      --tool-call-parser glm47 \
+      --enable-auto-tool-choice \
+      --enable-prefix-caching \
+      --kv-cache-dtype fp8 \
+      -tp {tensor_parallel}

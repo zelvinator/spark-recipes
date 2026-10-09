@@ -1,0 +1,28 @@
+recipe_version: "1"
+name: GLM-5.1
+container: vllm-node-b12x
+model: cyankiwi/GLM-5.1-AWQ-4bit
+defaults:
+  port: 8000
+env:
+  VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "1800"
+  HF_HUB_OFFLINE: "1"
+  TORCH_CUDA_ARCH_LIST: "12.1a"
+  CONTAINER_NCCL_IB_TC: "106"
+  CONTAINER_NCCL_NET_PLUGIN: "none"
+  CONTAINER_NCCL_IB_SUBNET_AWARE_ROUTING: "1"
+  CONTAINER_NCCL_IB_MERGE_NICS: "0"
+  CONTAINER_NCCL_MAX_NCHANNELS: "4"
+  CONTAINER_NCCL_MIN_NCHANNELS: "4"
+  CONTAINER_NCCL_CUMEM_ENABLE: "0"
+  CONTAINER_NCCL_DEBUG: "WARN"
+  NCCL_DEBUG: WARN
+command: |
+  vllm serve cyankiwi/GLM-5.1-AWQ-4bit --host 0.0.0.0 --port {port} --trust-remote-code \
+  --reasoning-parser glm45 \
+  --tool-call-parser glm47 \
+  --enable-auto-tool-choice \
+  --enable-prefix-caching  \
+  --tensor-parallel-size 4 \
+  --kv-cache-dtype fp8 \
+  --max-model-len auto --max-num-seqs 1 --max-num-batched-tokens 8096 --gpu-memory-utilization 0.88 

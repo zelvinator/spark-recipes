@@ -1,0 +1,36 @@
+# GLM-4.5-FP8 — NFS-served via cache box (zai-org/GLM-4.5-FP8)
+# Prefetch load-strategy: reads weights sequentially into page cache via NFS
+# (turns the old ~100 MB/s lazy mmap-fault path into the fast cached path)
+recipe_version: "1"
+name: GLM-4.5-FP8
+description: vLLM serving zai-org/GLM-4.5-FP8 from NFS mount (cache box)
+model: zai-org/GLM-4.5-FP8
+
+container: vllm-node
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 4
+  gpu_memory_utilization: 0.82
+  max_model_len: auto
+  max_num_seqs: 4
+
+env:
+  HF_HUB_DISABLE_FILE_LOCKING: "1"
+
+
+command: |
+  vllm serve zai-org/GLM-4.5-FP8 \
+      --host {host} \
+      --port {port} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --reasoning-parser glm45 \
+      --tool-call-parser glm47 \
+      --enable-auto-tool-choice \
+      --enable-prefix-caching \
+      --trust-remote-code \
+      --kv-cache-dtype fp8 \
+      -tp {tensor_parallel}

@@ -1,0 +1,117 @@
+# GLM-5.3 (full 743B) Int4-Int8Mix on 4x DGX Spark — TP=4, MTP k=4, 200K context
+# Based on tonyd2wild/GLM-5.3-Int4-Int8Mix-TP4-4x-DGX-Spark (launch/launch-glm53-tp4.sh),
+# which itself transfers the proven GLM-5.2-QuantTrio-200K recipe (5.2 and 5.3 are
+# structurally identical; only weights path + served name differ).
+#
+# IMAGE (required): vllm-node-tf5-glm52-b12x:probe-modded
+#   Built 2026-09-05 on spark1 from spark-vllm-docker (eugr):
+#     ./build-and-copy.sh --vllm-ref ab666069935c1f23e8ef56038b4659ac9e8f19f8 \
+#       -t vllm-node-tf5-glm52-b12x:probe
+#   then baked INSIDE the probe container (idempotent sequence; sources in
+#   ~/vendor-glm52-bake/ on spark1, vendored from tonyd2wild 5.2 repo = CosmicRaisins
+#   glm-5.2-gb10 kernels/, Apache-2.0, hash-identical to ~/glm-triton):
+#     bash /mods/glm52-sm12x-sparse/run.sh         # 10 sm12x Triton kernels + DeepGEMM bypass
+#     bash /mods/glm52-b12x-sparse/run.sh          # b12x pkg (CUDA-graph-safe sparse-MLA decode)
+#     python3 /patches/fix-indexer-mtp-overhang.py # DSA indexer block-table +1  — MANDATORY for
+#                                                  # max-num-seqs>=3 (engine crash otherwise)
+#     docker commit --change 'ENTRYPOINT ["/opt/nvidia/nvidia_entrypoint.sh"]' \
+#                   --change 'CMD []' <container> vllm-node-tf5-glm52-b12x:probe-modded
+#   Distributed to workers: docker save | ssh <worker> docker load (fabric IPs).
+#
+# MEMORY LAW (GB10 unified memory — CPU/GPU share 121 GB, page cache eats CUDA-visible
+#   memory 1:1; measured: 37 GiB page cache -> CUDA sees only 74/121 GiB):
+#   * mods/drop-caches MUST run on every node for the whole boot window (unconditional 60 s loop).
+#   * --kv-cache-memory-bytes pinned (10950000000) -> deterministic 200,064-token pool;
+#     note vLLM then SKIPS profiling (no validation that activations/NCCL/graphs still fit).
+#   * vm.swappiness=10 host-side — set 2026-09-05 on all 4 nodes
+#     (/etc/sysctl.d/90-spark-inference.conf); at default 0-1 the box wedges with swap untouched.
+#   * Steady state MemAvailable ~0.7 GB + ~3.2 GB parked swap = DESIGNED operating point.
+#   * gmu 0.91 is only safe under the flusher; 0.90 leaves 9.78 GiB KV < 10.19 GiB needed for 200K.
+#
+# GRAPH TRAP: cudagraph_mode FULL without pinned capture sizes kills the engine on the first
+#   concurrent CHAT request (KeyError: chatcmpl-<id>; /v1/completions unaffected). Pinned below.
+#
+# FIRST-BOOT VALIDATION (upstream "stage 1"): boot once WITHOUT the --speculative-config line
+#   (bare) and pass a temp-0 coherence probe before trusting MTP numbers. Digit soup on bare =
+#   quant/kernel problem; with MTP only = drafter. Verify boot: "GPU KV cache size" ~= 200,064
+#   tokens, NCCL_DEBUG=INFO shows NET/IB (not Socket fallback), temp-0 correctness probe.
+#   Spot-check quant cohesion per the 5.2 recipe: count-to-100 temp 0.
+#
+# Upstream perf anchor (same arch/recipe lane, 5.3): MTP-4 26.9 tok/s e2e single-stream temp-0
+#   (97.0% accept, 100/100 correct), prose C1..C6 aggregate 19.6 -> 51.9 tok/s.
+
+# 2026-09-10 RCA tuning (supersedes header memory figures above): gmu 0.87, KV pin 9.0e9
+# (pool ~164k tok), ctx 160000, --enable-prefix-caching removed, cudagraph_capture_sizes [1,2] pinned
+# (graph-trap fix), served name glm-5.3. Owner report: freeze hit on FIRST request after clean load
+# = capture/warmup envelope, not the loader. Margins widened per forum corpus (t/369076, t/381428).
+
+recipe_version: "2"
+name: GLM-5.3-Int4-Int8Mix-TP4
+description: GLM-5.3 full (743B) Int4-Int8Mix on 4x DGX Spark, TP=4, MTP k=4, 200K ctx, fp8_ds_mla KV
+model: 2wild4tv/GLM-5.3-Int4-Int8Mix
+cluster_only: true
+
+# Pre-baked image: pinned vLLM ab6660699 + vendored sm12x kernels + b12x + overhang patch.
+# (Same tag glm-52.yaml declares — one image serves both GLM-5.2 and GLM-5.3 full recipes.)
+container: vllm-node-tf5-glm52-b12x:probe-modded
+
+mods:
+  - mods/drop-caches
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 4
+  gpu_memory_utilization: 0.91
+  max_model_len: 200000 
+  max_num_seqs: 2
+
+env:
+  # MECHANISM (verified on the flash lane 2026-08-30): only CONTAINER_-prefixed vars
+  # reach the engine (-e); interface/HCA/socket vars (NCCL_IB_HCA, NCCL_SOCKET_IFNAME,
+  # UCX_NET_DEVICES, NCCL_IB_DISABLE, NCCL_IGNORE_CPU_AFFINITY) stay launcher-injected
+  # from .env — do not duplicate them here.
+  HF_HUB_OFFLINE: "1"
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "1800"
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+  VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "256"
+  VLLM_DISABLE_FLASHINFER_AUTOTUNE: "1"
+  GLM52_BIND_HOST_TRITON: "1"
+  GLM52_MQA_LOGITS_TRITON: "1"
+  GLM52_PAGED_MQA_TRITON: "1"
+  GLM52_PAGED_MQA_TOPK_CHUNK_SIZE: "8192"
+  GLM52_B12X_MLA: "1"
+  TORCH_CUDA_ARCH_LIST: "12.1a"
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  NCCL_IB_TC: "106"
+  NCCL_NET_PLUGIN: "none"
+  NCCL_IB_SUBNET_AWARE_ROUTING: "1"
+  NCCL_IB_MERGE_NICS: "0"
+  NCCL_MAX_NCHANNELS: "4"
+  NCCL_MIN_NCHANNELS: "4"
+  NCCL_CUMEM_ENABLE: "0"
+  NCCL_DEBUG: "WARN"
+
+#    --speculative-config '{{"method":"mtp","num_speculative_tokens":4,"draft_tensor_parallel_size":1,"attention_backend":"FLASHMLA_SPARSE"}}'
+# First-boot bare variant: remove the --speculative-config line above.
+# Concurrency overrides: ./run-recipe.sh glm-5-3-int4int8 --max-model-len 200000 -- --max-num-seqs 2
+# Swap discipline: this and glm-5-3-flash share port 8000 and the full fleet — never run both.
+
+command: |
+  vllm serve 2wild4tv/GLM-5.3-Int4-Int8Mix \
+    --served-model-name glm-5.3-flash \
+    --host {host} --port {port} \
+    --trust-remote-code \
+    --reasoning-parser glm45 --tool-call-parser glm47 --enable-auto-tool-choice \
+    --enable-prefix-caching \
+    --async-scheduling \
+    --tensor-parallel-size {tensor_parallel} \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens 8192 \
+    --gpu-memory-utilization 0.91 --kv-cache-memory-bytes 10950000000 \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --kv-cache-dtype fp8_ds_mla \
+    --compilation-config '{{"cudagraph_mode":"FULL","cudagraph_capture_sizes":[1,2]}}' 

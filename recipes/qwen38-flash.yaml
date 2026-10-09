@@ -1,0 +1,39 @@
+recipe_version: "1"
+name: Qwen/Qwen3.8-Flash-Next-FP8
+hdescription: vLLM serving Qwen/Qwen3.8-Flash-Next-FP8
+model: Qwen/Qwen3.8-Flash-Next-FP8
+
+container: vllm/vllm-openai:qwen38-flash-next
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 4
+  gpu_memory_utilization: 0.83
+  max_model_len: auto
+  max_num_seqs: 4
+
+env:
+  HF_HUB_DISABLE_FILE_LOCKING: "1"
+  VLLM_ENGINE_READY_TIMEOUT_S: 3600
+  HF_HUB_OFFLINE: 1
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: 1
+
+#vllm serve Qwen/Qwen3.8-Flash-Next-FP8 \
+command: |
+  vllm serve dealignai/Qwen3.8-Flash-Next-UNCENSORED-FP8 \
+    --max-num-seqs {max_num_seqs} \
+    --gpu-memory-util {gpu_memory_utilization} \
+    --enable-prefix-caching \
+    --no-enable-flashinfer-autotune \
+    --tensor-parallel-size 4 \
+    --load-format fastsafetensors \
+    --distributed-executor-backend mp \
+    --enable-auto-tool-choice \
+    --max-num-batched-tokens 8192 \
+    --compilation-config '{{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}}' \
+    --speculative-config '{{"method":"mtp","num_speculative_tokens":3}}' \
+    --hf-overrides '{{"text_config": {{"rope_parameters": {{"mrope_interleaved": true, "mrope_section": [11, 11, 10], "rope_type": "yarn", "rope_theta": 10000000, "partial_rotary_factor": 0.25, "factor": 4.0, "original_max_position_embeddings": 262144}}}}}}' \
+    --max-model-len 1000000 \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser qwen3

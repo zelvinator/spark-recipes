@@ -1,0 +1,276 @@
+# GLM-5.3-Flash FP8 — TP=4 across 4x DGX Spark, repo b12x stack
+# Native FP8 weights; the glm5_next hybrid (KDA linear + sparse MLA + indexer)
+# is served natively by the b12x fork's B12X attention backend — no indexer mod
+# needed (upstream glm-5.3-flash.yaml runs mods: [] with plain
+# --attention-backend B12X; B12X_MLA_SPARSE/VLLM_USE_B12X_SPARSE_INDEXER is
+# the GLM-5.2 pure-sparse-MLA path, not for glm5_next).
+# Image: vllm-node-b12x, repo-built via build-and-copy.sh --exp-b12x
+# (local-inference-lab/vllm @ dev/jovian-judgement + lukealonso/b12x).
+# --setup builds it if missing; vllm-node-b12x:latest is already on the head.
+#
+# 2026-09-06 (rev 12): rev 11's selection-compaction fix did not remove the
+#   layer-3 `after_attn` non-finite state. Added mods/
+#   diag-glm5next-b12x-attention to probe the B12X sparse-MLA forward path
+#   itself (query/output finiteness, selection source, active counts, cache
+#   lengths, and selected-index bounds) in layer 3.
+#
+# 2026-09-06 (rev 11): the rev 10 stage instrumentation localized the first
+#   non-finite state to `after_attn` in layer 3, so the B12X sparse-MLA
+#   attention output itself is bad. GLM-5Next's non-DCP prefill fallback
+#   expands C4 pool selections into a 2051-wide request-local top-k tensor,
+#   with tail tokens at fixed offset 2048+, but the B12X sparse kernel
+#   consumes only the first active_count entries of each row. Short rows can
+#   therefore have an all-invalid consumed prefix (the first prompt token has
+#   its only valid entry at offset 2048) and produce NaN. mods/
+#   fix-glm5next-b12x-sparse-prefill-compaction compacts valid entries to
+#   the front in that conversion; prefix order is irrelevant to sparse
+#   attention. The rev 10 diagnostic remains for one verification pass.
+#
+# 2026-09-06 (rev 10): the rev 9 diagnostic localized the first non-finite
+#   state to layer 3 (the first sparse-MLA layer): the layer input is finite,
+#   but the mHC residual stream is already bad by the end of the layer. The
+#   same diagnostic now instruments the mHC path inside layer 3 (mHC pre,
+#   attention, mHC post/pre, MLP) to identify the offending stage.
+#
+# 2026-09-06 (rev 9): rev 8's ignored-layer normalization still produced the
+#   same degenerate output. Added mods/diag-glm5next-first-nan (run with
+#   --enforce-eager) to print the first decoder layer whose hidden/residual/
+#   post/comb state goes non-finite, so the next fix can target the actual
+#   offending submodule instead of A/B'ing kernels blindly.
+#
+# 2026-09-06 (rev 8): the rev 7 build still collapsed to a repeated token with
+#   NaN logprobs. A/B'ing the B12X KDA decode kernel (temporarily forcing
+#   enable_b12x_kda_decode = False via mods/diag-glm5next-no-b12x-kda-decode)
+#   made no difference, so the cause is upstream of decode. The checkpoint's
+#   modules_to_not_convert lists many more BF16 modules than the KDA
+#   projections and lm_head (mlp.gate, the sparse-MLA indexer projections,
+#   MTP projections, ...), and its HF prefixes never exact-match the vLLM
+#   runtime prefixes. mods/fix-glm5next-bf16-layers now also normalizes
+#   quant_config.ignored_layers in Glm5NextForCausalLM so Fp8Config skips all
+#   of them instead of building them with the -finfo.min sentinel scale.
+#
+# 2026-09-06 (rev 7): restored --block-size 256 to the command. The B12X C4
+#   sparse indexer (models/glm5next/nvidia/pooled_indexer.py) requires the
+#   model block size to be a multiple of 256 (block_size % 256 == 0); without
+#   an explicit --block-size vLLM fell back to its default of 16 and worker
+#   init aborted at Glm5NextPooledIndexer before any weights were loaded. 256
+#   matches the sibling b12x FP8 recipe (deepseek-v4-flash) and the original
+#   rev 3 value; the 2304 in defaults was stale.
+#
+# 2026-09-06 (rev 6): both fixes are now actually applied. mods: enables
+#   mods/fix-b12x-fp8-linear-fallback + mods/fix-glm5next-bf16-layers (rev 5
+#   claimed the BF16 mod was "applied below" but mods: was still []). The BF16
+#   mod is the real fix for the repetition loops: config.json
+#   quantization_config.modules_to_not_convert uses HF prefixes
+#   (model.layers.N... / bare lm_head) that never exact-match the vLLM runtime
+#   prefixes (language_model.model.layers.N... / language_model.lm_head) — the
+#   mapper only rewrites model.language_model.->language_model.model. — so the
+#   BF16 KDA projections (34 layers) + lm_head + MTP head were built as
+#   Fp8LinearMethod with the -finfo.min sentinel weight_scale_inv (dequant
+#   garbage). Same class as upstream vLLM #21669 (fixed there by PR #44628's
+#   substring match, which this fork lacks). Command: --attention-backend B12X
+#   restored (required by the 12 sparse-MLA layers; attention.py only wires the
+#   B12X sparse backend when the backend is B12X), --linear-backend b12x
+#   restored behind the linear-fallback mod, --kv-cache-dtype fp8_e4m3 -> fp8
+#   (b12x convention). MLA q_a/q_b/kv_a/o_proj are FP8 in the checkpoint but
+#   need no mod: model.py dequantizes them to BF16 on load
+#   (_try_load_fp8_attn_proj) since the runtime MLA is built unquantized for
+#   non-modelopt_mixed configs.
+#
+# 2026-09-06 (rev 5): engine came up cleanly after rev 4, but completions
+# were degenerate (repetition loops). Root cause: this is a MIXED checkpoint
+# (MoE/dense-MLP/some-MLA = block-FP8; KDA projections + lm_head = BF16,
+# listed in quantization_config.modules_to_not_convert) and Fp8Config's
+# ignore list never matches — it uses HF prefixes (model.layers.N...) while
+# vLLM runtime prefixes are language_model.model.layers.N..., and exact
+# match requires the full string. So the BF16 layers were built as
+# Fp8LinearMethod with no serialized scales: weight_scale_inv stays at the
+# -finfo.min sentinel and dequant is garbage. Fix = mods/fix-glm5next-bf16-
+# layers (applied below): KDA projections, lm_head and the MTP draft head
+# are built unquantized (BF16), as the checkpoint intends. With KDA in_proj
+# no longer FP8, rev 4's Marlin fallback no longer fires for it — the
+# kernel mod stays as a generic guard.
+#
+# 2026-09-05 (rev 4): --linear-backend b12x restored behind the new
+# mods/fix-b12x-fp8-linear-fallback (forced backend now falls back
+# per-layer; cutlass can_implement gained the 128-alignment guard).
+# --moe-backend b12x stays dropped — b12x is not a registered FP8 MoE
+# backend in this fork (NVFP4/MXFP4 oracles only). Details: "Fallbacks"
+# section below.
+#
+# 2026-09-05 (rev 3): radixark/vllm-glm53-flash:sm121-v8 -> vllm-node-b12x.
+# Adopted from upstream recipes/glm-5.3-flash.yaml (NVFP4-Spark, TP=2):
+#   B12X attention + b12x moe/linear backends (moe backend later dropped,
+#   see rev 4), --mamba-cache-mode align,
+#   prefix caching, chunked prefill, --kv-cache-dtype fp8 (b12x convention;
+#   replaces fp8_e4m3 — all b12x recipes use plain fp8), --block-size 256
+#   (replaces 2304), instanttensor loader (no NFS copy), AOT/V2-runner/
+#   roce-allreduce env, spec config with humming draft + B12X attention.
+# Kept from rev 2 (validated on this cluster): FP8 snapshot pin, TP=4,
+#   gmu 0.885 (upstream's --kv-cache-memory-bytes 10G is NVFP4/TP2-specific,
+#   not adopted — deepseek FP8 b12x lane is gmu-only too), max_num_batched_
+#   tokens 8192 (upstream: 4096; A/B-able), MTP k=4 (upstream k=5; A/B by
+#   appending after --, vLLM last-wins:
+#   ./run-recipe.sh glm-5-3-flash -- --speculative-config '{"method":"mtp","num_speculative_tokens":5,"moe_backend":"humming","attention_backend":"B12X"}'
+#   ), parsers, NCCL tuning, lanes.
+# Dropped: --trust-remote-code (glm5_next is native in the b12x fork; the FP8
+#   checkpoint has no custom code), --async-scheduling (upstream glm5_next
+#   recipe omits it; b12x supports it — re-add if A/B shows a win),
+#   VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS (radixark-specific),
+#   mods/glm53-flash-indexer (radixark-specific; see above).
+# ENV MECHANISM (corrects the rev 2 note): recipe env entries are exported
+#   INSIDE the container by the generated launch script (run-recipe.py
+#   generate_launch_script) and inherited by the engine — plain VLLM_*/NCCL_*
+#   names reach the engine. Rev 2's CONTAINER_ prefixes were inert no-ops
+#   (launch-cluster.sh strips that prefix only from .env keys, and .env has
+#   none); rev 3 uses plain names, so the NCCL tuning below goes live for the
+#   first time. Launcher-injected (do not duplicate): NCCL_IGNORE_CPU_AFFINITY,
+#   PYTORCH_CUDA_ALLOC_CONF (launch-cluster.sh:10-11) and the per-node
+#   VLLM_HOST_IP / UCX_NET_DEVICES / NCCL_SOCKET_IFNAME / NCCL_IB_HCA /
+#   NCCL_IB_DISABLE / GLOO/TP/Ray vars (launch-cluster.sh get_env_flags).
+# Switch side (CRS804): PFC tc3 + ECN q3 live; DSCP 26 -> prio 3 verified on
+#   hosts. TC 104 and 106 both map to DSCP 26; 106 = ECT-capable (DCQCN-ready).
+# Fallbacks if the b12x FP8 path misbehaves at launch:
+#   - 2026-09-06 (rev 5, verified on this cluster): engine started clean
+#     (rev 4) but produced degenerate output (repetition loops). The
+#     checkpoint is MIXED — MoE/dense-MLP/some-MLA projections are
+#     block-FP8, while the KDA projections and lm_head are BF16, listed in
+#     quantization_config.modules_to_not_convert. Fp8Config consults that
+#     list, but the entries use HF prefixes (model.layers.N... / bare
+#     lm_head) that never match the vLLM runtime prefixes
+#     (language_model.model.layers.N... / language_model.lm_head) under
+#     exact match, so the BF16 layers were built as Fp8LinearMethod. They
+#     serialize no scales, so weight_scale_inv stays at the -finfo.min
+#     sentinel and dequant is garbage. Fix = mods/fix-glm5next-bf16-layers:
+#     KDA projections (kda.py), lm_head (model.py) and the MTP draft head
+#     (mtp.py) are built unquantized, matching the checkpoint. Consequence:
+#     KDA in_proj is no longer an FP8 layer, so rev 4's Marlin fallback
+#     path no longer fires for it (aligned FP8 layers still use B12X; the
+#     kernel mod remains a generic guard for other non-128-aligned linears).
+#   - 2026-09-05 (rev 4, verified on this cluster): plain
+#     --linear-backend b12x died at kernel selection (ValueError) because
+#     the KDA in_proj_qkvgfab TP=4 shard is 6288 wide (3*2048 q/k/v + 16
+#     beta + 128 f_a; 6288 % 128 = 16) and the forced b12x backend has no
+#     per-layer fallback. Dropping the flag instead died in the first
+#     forward: auto selection picked CutlassFp8BlockScaledMMKernel (its
+#     can_implement never checks N; FlashInfer block-scale is SM90-only,
+#     DeepGEMM needs N%64) and the SM120/121 CUTLASS blockwise GEMM
+#     aborted at runtime with "cutlass_gemm_caller ...
+#     cutlass_gemm_caller.cuh:52, Invalid status". Fix = mods/
+#     fix-b12x-fp8-linear-fallback (applied below, both kept): (1) cutlass
+#     can_implement requires 128-aligned N/K; (2) a forced
+#     --linear-backend falls back to the default kernel list per layer.
+#     Result: aligned layers keep B12X; only the 34 KDA in_proj layers
+#     (N=6288) fall back to Marlin block-FP8.
+#   - --moe-backend b12x stays DROPPED: the b12x MoE backend is registered
+#     in the NVFP4/MXFP4 fused-MoE oracles only; the block-FP8 oracle has
+#     no b12x entry, so the flag raises ValueError at the first MoE layer.
+#     Auto selection picks a working FP8 MoE backend.
+#   - instanttensor load fails on NFS -> drop the two instanttensor lines
+#     (default loader streams from the NFS-mounted hub).
+# Lanes (upstream occupancy): 200k/15, 500k/5, 1m/3 seqs — override with:
+#   ./run-recipe.sh glm-5-3-flash --max-model-len 1000000 -- --max-num-seqs 3
+# recipe_version is the repo schema version (run-recipe.py supports only "1");
+# recipe revisions are tracked in these dated notes.
+#
+# 2026-09-02 (rev 2): MTP k=3 -> 4; weights snapshot re-pinned e5a2094 -> 3eb1880f
+# (dealignai 09-02 push; safetensors bit-identical to the old pin — only two small
+# files changed: generation_config.json now pins repetition_penalty 1.1 = the
+# repetition-loop fix, and chat_template clear_thinking default flipped false->true.
+# NOTE: lmproxy glm-53-flash-coding relies on the old default (preserved history
+# across turns) — pin clear_thinking:false there if the flip is unwanted).
+# k=4 basis: the earlier "k=4 worse" A/B ran on the buggy 08-26 weights; corrected
+# A/B (Wpnx330 08-31, fixed revision): 2.87 vs 2.24 accepts/step, 35-40 tok/s tiny.
+# Snapshot 3eb1880f lives on the shared NFS hub (/mnt/k8s/ai/hub), so workers see
+# it too. NOT applied to the live service — takes effect at next launch.
+
+recipe_version: "1"
+name: GLM-5.3-Flash-FP8
+description: vLLM serving GLM-5.3-Flash FP8 (b12x stack), TP=4 on a 4-Spark cluster
+model: dealignai/GLM-5.3-Flash-ABLITERATED-FP8  # what command: actually serves; --setup downloads this
+
+container: vllm-node-b12x
+
+build_args:
+  - --exp-b12x
+
+cluster_only: true
+
+mods:
+  - mods/fix-b12x-fp8-linear-fallback
+  - mods/fix-glm5next-bf16-layers
+  - mods/fix-glm5next-b12x-sparse-prefill-compaction
+  - mods/diag-glm5next-first-nan
+  - mods/diag-glm5next-b12x-attention
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 4
+  pipeline_parallel: 1
+  decode_context_parallel: 1
+  block_size: 256
+  max_model_len: 1000000
+  max_num_seqs: 4
+  max_num_batched_tokens: 8192
+  num_speculative_tokens: 4
+  gpu_memory_utilization: 0.885
+
+env:
+  # Timeouts / general (plain names — exported in-container by the launch script)
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+  VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "1800"
+    #HF_HUB_DISABLE_FILE_LOCKING: "1"
+  HF_HUB_OFFLINE: "1"
+  # b12x stack (per upstream glm-5.3-flash.yaml)
+  CUTE_DSL_ARCH: "sm_121a"
+  SAFETENSORS_FAST_GPU: "1"
+  VLLM_ENABLE_ROCE_ALLREDUCE: "1"
+  VLLM_ROCE_ALLREDUCE_MAX_SIZE: "2MB"
+  VLLM_WORKER_MULTIPROC_METHOD: "spawn"
+  VLLM_SSM_CONV_STATE_LAYOUT: "DS"
+  VLLM_USE_AOT_COMPILE: "1"
+  VLLM_USE_MEGA_AOT_ARTIFACT: "1"
+  VLLM_USE_V2_MODEL_RUNNER: "1"
+  VLLM_ENABLE_PCIE_ALLREDUCE: "0"
+  B12X_POLICY_MODE: "auto"
+  INSTANTTENSOR_BACKEND: "BUFFERED"
+  INSTANTTENSOR_BUFFER_SIZE: "67108864"
+  INSTANTTENSOR_CHUNK_SIZE: "8388608"
+  INSTANTTENSOR_CONCURRENCY: "1"
+  INSTANTTENSOR_IO_DEPTH: "3"
+  # NCCL tuning — was inert in rev 2 (CONTAINER_ no-op); live for the first time
+  NCCL_IB_TC: "106"
+  NCCL_NET_PLUGIN: "none"
+  NCCL_IB_SUBNET_AWARE_ROUTING: "1"
+  NCCL_IB_MERGE_NICS: "0"
+  NCCL_MAX_NCHANNELS: "4"
+  NCCL_MIN_NCHANNELS: "4"
+  NCCL_CUMEM_ENABLE: "0"
+  NCCL_DEBUG: "WARN"
+
+command: |
+  vllm serve /root/.cache/huggingface/hub/models--dealignai--GLM-5.3-Flash-ABLITERATED-FP8/snapshots/3eb1880f95b1be4f875d62ea8adc3dc194537729/ \
+      --served-model-name glm-5.3-flash \
+      --host {host} \
+      --load-format instanttensor \
+      --port {port} \
+      --tensor-parallel-size {tensor_parallel} \
+      --decode-context-parallel-size {decode_context_parallel} \
+      --mamba-cache-mode align \
+      --attention-backend B12X \
+      --linear-backend b12x \
+      --enable-prefix-caching \
+      --enable-chunked-prefill \
+      --no-enable-flashinfer-autotune \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --kv-cache-dtype fp8 \
+      --block-size 256 \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --model-loader-extra-config '{{"instanttensor_copy":false}}' \
+      --reasoning-parser glm45 \
+      --tool-call-parser glm47 \
+      --enable-auto-tool-choice

@@ -1,0 +1,52 @@
+# Recipe: DeepSeek V4 Flash
+# DeepSeek V4 Flash with sparse MLA/DeepGEMM experimental SM120 support
+
+recipe_version: "1"
+name: XiaomiMiMo/MiMo-V2.5
+description: vLLM serving XiaomiMiMo/MiMo-V2.5
+
+# HuggingFace model to download (optional, for --download-model)
+model: XiaomiMiMo/MiMo-V2.5
+
+# Container image to use
+container: vllm-node
+
+# Can only be run in a cluster
+cluster_only: true
+
+# No mods required
+mods: []
+
+# Default settings (can be overridden via CLI where supported)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 4
+  gpu_memory_utilization: 0.85
+  max_model_len: 1000000
+  block_size: 256
+  max_num_seqs: 6
+  max_num_batched_tokens: 8192
+  num_speculative_tokens: 2
+
+# Environment variables
+env:
+  DG_JIT_USE_NVRTC: "0"
+
+# The vLLM serve command template
+command: |
+  vllm serve XiaomiMiMo/MiMo-V2.5 \
+      --host {host} \
+      --port {port} \
+      --tensor-parallel-size 4 \
+      --trust-remote-code \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --enforce-eager \
+      --kv-cache-dtype fp8_e4m3 \
+      --max-num-seqs {max_num_seqs} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --tool-call-parser mimo \
+      --distributed-executor-backend ray \
+      --attention-backend triton_attn_diffkv \
+      --enable-auto-tool-choice \
+      --reasoning-parser mimo

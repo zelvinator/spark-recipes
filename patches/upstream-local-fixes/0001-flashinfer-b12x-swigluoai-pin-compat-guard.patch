@@ -1,0 +1,25 @@
+diff --git a/docker/patch_vllm_flashinfer_b12x_swigluoai.py b/docker/patch_vllm_flashinfer_b12x_swigluoai.py
+index 9b83d83..419ddb4 100644
+--- a/docker/patch_vllm_flashinfer_b12x_swigluoai.py
++++ b/docker/patch_vllm_flashinfer_b12x_swigluoai.py
+@@ -315,6 +315,20 @@ def main() -> int:
+         print(f"{EXPERT_REL} is absent; targeted PR #47392 patch is not applicable")
+         return 0
+ 
++    # pin-compat guard (local, 2026-09-05): refs whose FlashInferB12xExperts still
++    # carries the pre-#47392 single-activation shape (e.g. vLLM ab666069, the
++    # GLM-5.2/5.3 Spark pin) predate the activation-map refactor this patch
++    # rewires. The SwiGLU-OAI pass-through is NVFP4-B12x-MoE-only — unused by the
++    # Int4-Int8Mix/marlin serving lane — so per the docstring's skip policy,
++    # treat as not applicable instead of failing the build.
++    expert_probe = expert_path.read_text(errors="replace")
++    if "MoEActivation.RELU2_NO_MUL" not in expert_probe:
++        print(
++            f"{EXPERT_REL} has the pre-#47392 single-activation shape; "
++            "targeted SwiGLU-OAI patch is not applicable — skipping"
++        )
++        return 0
++
+     paths_and_patchers = (
+         (source_root / FLASHINFER_UTIL_REL, patch_flashinfer_util),
+         (expert_path, patch_expert),

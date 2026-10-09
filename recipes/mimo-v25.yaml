@@ -1,0 +1,42 @@
+recipe_version: "1"
+name: MiMo-V2.5-FP8-TP4
+description: MiMo-V2.5 FP8 on 4× DGX Spark, TP=4, no MTP (avoids unpatched sync bug)
+model: XiaomiMiMo/MiMo-V2.5
+container: vllm-node
+cluster_only: true
+mods: []
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  VLLM_USE_PRECOMPILED: "1"
+  VLLM_USE_RAY_V2_EXECUTOR_BACKEND: "1"
+  VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: "1"
+  NCCL_NVLS_ENABLE: "0"
+
+defaults:
+  port: 8300
+  host: 0.0.0.0
+  tensor_parallel: 4
+  gpu_memory_utilization: 0.80
+  max_model_len: auto
+  max_num_batched_tokens: 8192
+
+command: |
+  vllm serve XiaomiMiMo/MiMo-V2.5 \
+    --served-model-name MiMo-V2.5 \
+    --tensor-parallel-size {tensor_parallel} \
+    --distributed-executor-backend mp \
+    --no-async-scheduling \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --kv-cache-dtype fp8 \
+    --enable-prefix-caching \
+    --trust-remote-code \
+    --reasoning-parser mimo \
+    --tool-call-parser mimo \
+    --enable-auto-tool-choice \
+    --hf-overrides '{{"architectures":["MiMoV2OmniForCausalLM"]}}' \
+    --limit-mm-per-prompt '{{"image":4,"video":1,"audio":1}}' \
+    --host {host} \
+    --port {port}
